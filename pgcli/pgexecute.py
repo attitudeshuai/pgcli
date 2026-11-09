@@ -1,6 +1,8 @@
 import ipaddress
 import logging
+import os
 import traceback
+import uuid
 from collections import namedtuple
 import re
 import pgspecial as special
@@ -94,6 +96,161 @@ class ProtocolSafeCursor(psycopg.Cursor):
             self.protocol_error = True
             self.protocol_message = str(ex)
             _logger.debug("%s: %s" % (ex.__class__.__name__, ex))
+
+
+# Fixed number of rows pulled from the server in one round trip. Every batch
+# is rendered and handed to the output before the next one is requested, so
+# memory use is bounded by this many rows regardless of the result size.
+FETCH_BATCH_SIZE = 1000
+
+
+def is_select_statement(sql):
+    """Return True when *sql* is a plain SELECT (the same first-word check
+    used by the row-limit logic in :class:`pgcli.main.PGCli`)."""
+    try:
+        return sql.split()[0].lower() == "select"
+    except (AttributeError, IndexError):
+        return False
+
+
+class BatchedCursor:
+    """Cursor-like view over a server-side cursor that fetches rows in fixed
+    batches.
+
+    All state (batch buffer, delivered row count, stop flag) lives on this
+    per-execution object, so two queries -- even on the same connection --
+    can never share buffers or counters, and rerunning a query always starts
+    from a clean slate.
+
+    The wrapped server-side cursor is closed explicitly with :meth:`close`,
+    which sends ``CLOSE`` immediately and releases the portal on the server;
+    nothing is kept until process exit or the next statement.
+    """
+
+    def __init__(self, cursor, batch_size=FETCH_BATCH_SIZE, initial_batch=None):
+        self._cursor = cursor
+        self._batch_size = batch_size
+        # Rows already fetched when the cursor was opened (this also makes
+        # server notices reach the client before the result tuple is yielded).
+        self._buffer = list(initial_batch or [])
+        self._row_count = len(self._buffer)
+        self._stopped = False
+        self._closed = False
+        # Mirror the ProtocolSafeCursor surface so callers treating the object
+        # as a regular cursor never hit a missing attribute.
+        self.protocol_error = False
+        self.protocol_message = ""
+
+    # -- attributes shared with psycopg cursors -----------------------------
+    @property
+    def description(self):
+        return self._cursor.description
+
+    @property
+    def adapters(self):
+        return self._cursor.adapters
+
+    @property
+    def connection(self):
+        return self._cursor.connection
+
+    @property
+    def rowcount(self):
+        """Number of rows handed to consumers so far."""
+        return self._row_count
+
+    @property
+    def statusmessage(self):
+        # The command tag of a DECLARE/FETCH pair is not useful here; callers
+        # expect the SELECT tag and append ``rowcount`` to build the status.
+        return "SELECT"
+
+    @property
+    def closed(self):
+        return self._closed
+
+    @property
+    def batch_size(self):
+        return self._batch_size
+
+    def __bool__(self):
+        # A real cursor object is always truthy, even before any row is read.
+        return True
+
+    # -- row retrieval -------------------------------------------------------
+    def fetchmany(self, size=None):
+        """Return the next batch (at most ``size`` rows) from the server."""
+        if self._stopped or self._closed:
+            return []
+        if self._buffer:
+            batch = self._buffer
+            self._buffer = []
+            return batch
+        batch = self._cursor.fetchmany(size or self._batch_size)
+        self._row_count += len(batch)
+        return batch
+
+    def fetchone(self):
+        if self._stopped or self._closed:
+            return None
+        if not self._buffer:
+            self._buffer = self.fetchmany()
+            if not self._buffer:
+                return None
+        # The batch was counted when fetched; popping just hands it over.
+        return self._buffer.pop(0)
+
+    def fetchall(self):
+        rows = []
+        while True:
+            batch = self.fetchmany()
+            if not batch:
+                break
+            rows.extend(batch)
+        return rows
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        row = self.fetchone()
+        if row is None:
+            raise StopIteration
+        return row
+
+    # -- lifecycle -----------------------------------------------------------
+    def stop(self):
+        """Stop pulling further batches. Already delivered rows are kept."""
+        self._stopped = True
+
+    def close(self):
+        """Close the underlying portal immediately. Idempotent and safe to
+        call after a fetch error or a lost connection."""
+        if self._closed:
+            return
+        self._stopped = True
+        self._closed = True
+        self._buffer = []
+        cursor = self._cursor
+        try:
+            if not cursor.closed and not cursor.connection.closed:
+                cursor.close()
+        except psycopg.Error as ex:
+            _logger.debug("Error closing batched cursor: %r", ex)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+    def __del__(self):
+        # Safety net: a result that was never consumed must still release its
+        # portal instead of leaving a server-side cursor behind.
+        try:
+            self.close()
+        except Exception:
+            pass
 
 
 class PGExecute:
@@ -417,7 +574,12 @@ class PGExecute:
                 if explain_mode:
                     sql = self.explain_prefix() + sql
 
-                yield self.execute_normal_sql(sql) + (sql, True, False)
+                # Only plain SELECTs benefit from batched server-side
+                # fetching. Everything else (EXPLAIN, DML, virtual databases)
+                # keeps the regular client-side cursor path.
+                stream = not explain_mode and not self.is_virtual_database() and is_select_statement(sql)
+
+                yield self.execute_normal_sql(sql, stream=stream) + (sql, True, False)
             except psycopg.DatabaseError as e:
                 _logger.error("sql: %r, error: %r", sql, e)
                 _logger.error("traceback: %r", traceback.format_exc())
@@ -448,7 +610,7 @@ class PGExecute:
         """
         return self.conn.closed != 0
 
-    def execute_normal_sql(self, split_sql):
+    def execute_normal_sql(self, split_sql, stream=False):
         """Returns tuple (title, rows, headers, status)"""
         _logger.debug("Regular sql statement. sql: %r", split_sql)
 
@@ -470,6 +632,24 @@ class PGExecute:
             res = self.conn.pgconn.exec_(split_sql.encode())
             return title, None, None, res.command_status.decode()
 
+        if stream:
+            try:
+                # Notice handlers may rebind ``title`` while the statement
+                # runs; read it only after the execution helper returns.
+                cur, headers, status = self._execute_batched_sql(split_sql)
+                return title, cur, headers, status
+            except psycopg.DatabaseError as ex:
+                # Some pools/proxies do not support server-side portals. Fall
+                # back to the classic client-side cursor so old setups keep
+                # working instead of turning every SELECT into an error.
+                _logger.debug("Batched execution failed (%r); falling back to a client-side cursor.", ex)
+
+        cur, headers, status = self._execute_client_sql(split_sql)
+        return title, cur, headers, status
+
+    def _execute_client_sql(self, split_sql):
+        """The historical execution path: one client-side cursor holding
+        the full result set. Returns ``(cur, headers, status)``."""
         cur = self.conn.cursor()
         cur.execute(split_sql)
 
@@ -477,13 +657,64 @@ class PGExecute:
         # rows.
         if cur.description:
             headers = [x[0] for x in cur.description]
-            return title, cur, headers, cur.statusmessage
+            return cur, headers, cur.statusmessage
         elif cur.protocol_error:
             _logger.debug("Protocol error, unsupported command.")
-            return title, None, None, cur.protocol_message
+            return None, None, cur.protocol_message
         else:
             _logger.debug("No rows in result.")
-            return title, None, None, cur.statusmessage
+            return None, None, cur.statusmessage
+
+    def _execute_batched_sql(self, split_sql):
+        """Execute *split_sql* through a named server-side cursor wrapped in
+        a :class:`BatchedCursor`, so rows are fetched in fixed batches and
+        the portal can be closed as soon as output stops.
+        Returns ``(cur, headers, status)``."""
+        # WITH HOLD is required outside an explicit transaction (autocommit);
+        # inside a user transaction a plain portal is enough and is removed by
+        # CLOSE before the transaction ends.
+        idle = self.conn.info.transaction_status == psycopg.pq.TransactionStatus.IDLE
+        portal_name = f"pgcli_{os.getpid()}_{uuid.uuid4().hex}"
+        server_cur = self.conn.cursor(name=portal_name, withhold=idle)
+        try:
+            server_cur.execute(split_sql)
+            # Protocol-safe cursors (and test doubles) report unsupported
+            # commands as a protocol error instead of raising.
+            if getattr(server_cur, "protocol_error", False):
+                message = server_cur.protocol_message
+                self._close_cursor_safely(server_cur)
+                _logger.debug("Protocol error, unsupported command.")
+                return None, None, message
+            if not server_cur.description:
+                # SELECTs always describe a result; keep the same no-row
+                # answer as the client-side path in the odd case.
+                status = server_cur.statusmessage
+                self._close_cursor_safely(server_cur)
+                return None, None, status
+            # Pull the first batch eagerly: notices attached to the query
+            # arrive with it, and the first screen can be rendered without
+            # another round trip.
+            first_batch = server_cur.fetchmany(FETCH_BATCH_SIZE)
+            headers = [x[0] for x in server_cur.description]
+            return (
+                BatchedCursor(server_cur, FETCH_BATCH_SIZE, initial_batch=first_batch),
+                headers,
+                "SELECT",
+            )
+        except BaseException:
+            # Never leave a half-open portal behind on a declaration failure.
+            self._close_cursor_safely(server_cur)
+            raise
+
+    @staticmethod
+    def _close_cursor_safely(cursor):
+        """Close a cursor that may be a lightweight test double or a cursor
+        whose connection is already gone."""
+        try:
+            if not getattr(cursor, "closed", False):
+                cursor.close()
+        except Exception as ex:
+            _logger.debug("Error while closing cursor: %r", ex)
 
     def search_path(self):
         """Returns the current search path as a list of schema names"""

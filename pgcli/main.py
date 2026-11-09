@@ -59,7 +59,7 @@ from . import auth
 from .pgcompleter import PGCompleter
 from .pgtoolbar import create_toolbar_tokens_func
 from .pgstyle import style_factory, style_factory_output
-from .pgexecute import PGExecute
+from .pgexecute import PGExecute, BatchedCursor
 from .completion_refresher import CompletionRefresher
 from .config import (
     get_casing_file,
@@ -991,6 +991,7 @@ class PGCli:
             logger.error("traceback: %r", traceback.format_exc())
             click.secho(str(e), err=True, fg="red")
         else:
+            is_lazy = isinstance(output, _LazyOutput)
             try:
                 if self.output_file and not text.startswith(("\\o ", "\\log-file", "\\? ", "\\echo ")):
                     try:
@@ -1003,13 +1004,19 @@ class PGCli:
                             )
                             if not should_hide:
                                 click.echo(text, file=f)
-                            click.echo("\n".join(output), file=f)
+                            # A write failure stops the lazy generator, which
+                            # closes the cursor before any more FETCH is sent.
+                            for line in output:
+                                click.echo(line, file=f)
                             click.echo("", file=f)  # extra newline
                     except OSError as e:
                         click.secho(str(e), err=True, fg="red")
                 else:
                     if output:
-                        self.echo_via_pager("\n".join(output))
+                        if is_lazy:
+                            self.echo_via_pager(output)
+                        else:
+                            self.echo_via_pager("\n".join(output))
 
                 # Log to file in addition to normal output
                 if self.log_file and not text.startswith(("\\o ", "\\log-file", "\\? ", "\\echo ")) and not text.strip() == "":
@@ -1024,12 +1031,31 @@ class PGCli:
                             )
                             if not should_hide:
                                 click.echo(text, file=f)
-                            click.echo("\n".join(output), file=f)
+                            # Lazy output replays its cached lines; no extra
+                            # server round trips are needed.
+                            for line in output:
+                                click.echo(line, file=f)
                             click.echo("", file=f)  # extra newline
                     except OSError as e:
                         click.secho(str(e), err=True, fg="red")
             except KeyboardInterrupt:
                 pass
+            finally:
+                if is_lazy:
+                    # Release any portal still open (early pager exit, write
+                    # failure, KeyboardInterrupt...) and finalize query stats.
+                    output.close()
+                    state = output.state
+                    query = query._replace(
+                        successful=not state.failed and state.all_success,
+                        total_time=state.total or 0,
+                        execution_time=state.execution or 0,
+                        meta_changed=state.meta_changed,
+                        db_changed=state.db_changed,
+                        path_changed=state.path_changed,
+                        mutated=state.mutated,
+                        is_special=state.is_special,
+                    )
 
             if self.pgspecial.timing_enabled:
                 # Only add humanized time display if > 1 second
@@ -1348,25 +1374,40 @@ class PGCli:
 
         return new_cur, new_status
 
+    def _build_output_settings(self):
+        if self.pgspecial.auto_expand or self.auto_expand:
+            max_width = self.prompt_app.output.get_size().columns
+        else:
+            max_width = None
+
+        expanded = self.pgspecial.expanded_output or self.expanded_output
+        return OutputSettings(
+            table_format=self.table_format,
+            dcmlfmt=self.decimal_format,
+            floatfmt=self.float_format,
+            column_date_formats=self.column_date_formats,
+            missingval=self.null_string,
+            expanded=expanded,
+            max_width=max_width,
+            case_function=(self.completer.case if self.settings["case_column_headers"] else lambda x: x),
+            style_output=self.style_output,
+            max_field_width=self.max_field_width,
+            tuples_only=self.tuples_only,
+        )
+
     def _evaluate_command(self, text):
         """Used to run a command entered by the user during CLI operation
         (Puts the E in REPL)
 
-        returns (results, MetaQuery)
+        returns (results, MetaQuery). ``results`` is either the historical
+        materialized list of lines, or a :class:`_LazyOutput` that fetches
+        batches from the server while it is being consumed.
         """
         logger = self.logger
         logger.debug("sql: %r", text)
 
         # set query to formatter in order to parse table name
         self.formatter.query = text
-        all_success = True
-        meta_changed = False  # CREATE, ALTER, DROP, etc
-        mutated = False  # INSERT, DELETE, etc
-        db_changed = False
-        path_changed = False
-        output = []
-        total = 0
-        execution = 0
 
         # Run the query.
         start = time()
@@ -1379,35 +1420,23 @@ class PGCli:
             explain_mode=self.explain_mode,
         )
 
+        state = _StreamState()
+        prefix = []
+        all_success = True
+        meta_changed = False  # CREATE, ALTER, DROP, etc
+        mutated = False  # INSERT, DELETE, etc
+        db_changed = False
+        path_changed = False
         is_special = None
+        execution = 0
+        lazy = None
 
         for title, cur, headers, status, sql, success, is_special in res:
             logger.debug("headers: %r", headers)
             logger.debug("rows: %r", cur)
             logger.debug("status: %r", status)
 
-            if self._should_limit_output(sql, cur):
-                cur, status = self._limit_output(cur)
-
-            if self.pgspecial.auto_expand or self.auto_expand:
-                max_width = self.prompt_app.output.get_size().columns
-            else:
-                max_width = None
-
-            expanded = self.pgspecial.expanded_output or self.expanded_output
-            settings = OutputSettings(
-                table_format=self.table_format,
-                dcmlfmt=self.decimal_format,
-                floatfmt=self.float_format,
-                column_date_formats=self.column_date_formats,
-                missingval=self.null_string,
-                expanded=expanded,
-                max_width=max_width,
-                case_function=(self.completer.case if self.settings["case_column_headers"] else lambda x: x),
-                style_output=self.style_output,
-                max_field_width=self.max_field_width,
-                tuples_only=self.tuples_only,
-            )
+            settings = self._build_output_settings()
 
             # Hide query text for named queries in quiet mode
             if (
@@ -1420,11 +1449,63 @@ class PGCli:
             ):
                 title = None
 
+            if isinstance(cur, BatchedCursor):
+                # From here on rows arrive in batches and are rendered while
+                # they are fetched. Everything already rendered is replayed
+                # from ``prefix``.
+                first_tuple = (title, cur, headers, status, sql, success, is_special)
+
+                def generate_lines(first=first_tuple):
+                    nonlocal all_success, meta_changed, mutated, db_changed, path_changed, is_special, execution
+                    state.execution = execution
+                    for line in prefix:
+                        yield line
+                    pending = itertools.chain([first], res)
+                    try:
+                        for t_title, t_cur, t_headers, t_status, t_sql, t_success, t_is_special in pending:
+                            t_settings = self._build_output_settings()
+                            if isinstance(t_cur, BatchedCursor):
+                                state.register_cursor(t_cur)
+                                state.execution = state.execution or (time() - start)
+                                for line in self._iter_batched_result(t_cur, t_title, t_headers, t_status, t_settings, t_sql, state):
+                                    yield line
+                            else:
+                                if self._should_limit_output(t_sql, t_cur):
+                                    t_cur, t_status = self._limit_output(t_cur)
+                                for line in format_output(t_title, t_cur, t_headers, t_status, t_settings, self.explain_mode):
+                                    yield line
+                            is_special = t_is_special
+                            if t_success:
+                                mutated = mutated or is_mutating(t_status)
+                                db_changed = db_changed or has_change_db_cmd(t_sql)
+                                meta_changed = meta_changed or has_meta_cmd(t_sql)
+                                path_changed = path_changed or has_change_path_cmd(t_sql)
+                            else:
+                                all_success = False
+                                state.failed = True
+                    finally:
+                        # Closing the run() generator releases any cursor it
+                        # still holds; per-result batched cursors close
+                        # themselves when their line iterator finishes.
+                        res.close()
+                        state.all_success = all_success
+                        state.meta_changed = meta_changed
+                        state.mutated = mutated
+                        state.db_changed = db_changed
+                        state.path_changed = path_changed
+                        state.is_special = is_special
+                        state.total = time() - start
+
+                lazy = _LazyOutput(generate_lines(), state)
+                break
+
+            if self._should_limit_output(sql, cur):
+                cur, status = self._limit_output(cur)
+
             execution = time() - start
             formatted = format_output(title, cur, headers, status, settings, self.explain_mode)
 
-            output.extend(formatted)
-            total = time() - start
+            prefix.extend(formatted)
 
             # Keep track of whether any of the queries are mutating or changing
             # the database
@@ -1436,6 +1517,13 @@ class PGCli:
             else:
                 all_success = False
 
+        if lazy is not None:
+            # Flags are finalized while the lazy output is consumed; callers
+            # read the final values from ``state`` after iteration.
+            meta_query = MetaQuery(text, True, 0, 0, False, False, False, False, is_special)
+            return lazy, meta_query
+
+        total = time() - start
         meta_query = MetaQuery(
             text,
             all_success,
@@ -1448,7 +1536,153 @@ class PGCli:
             is_special,
         )
 
-        return output, meta_query
+        return prefix, meta_query
+
+    def _iter_batched_result(self, bc, title, headers, status, settings, sql, state):
+        """Yield output lines for one :class:`BatchedCursor`, fetching fixed
+        batches and rendering them as they arrive. The portal is always
+        closed when iteration finishes, fails, or is abandoned."""
+        batch_size = bc.batch_size
+        try:
+            first = bc.fetchmany()
+            if len(first) < batch_size:
+                yield from self._iter_single_batch(bc, first, title, headers, status, settings, sql)
+                return
+            # A full first batch might still be the whole result set.
+            second = bc.fetchmany()
+            if not second:
+                yield from self._iter_single_batch(bc, first, title, headers, status, settings, sql)
+                return
+            yield from self._iter_streaming_batches(bc, first, second, title, headers, settings, sql, state)
+        finally:
+            bc.close()
+
+    def _iter_single_batch(self, bc, rows, title, headers, status, settings, sql):
+        """Render a result that fits in a single batch through the historical
+        code path, so small result sets keep byte-for-byte identical output."""
+        if self._should_limit_output(sql, bc):
+            limit = min(self.row_limit, bc.rowcount)
+            rows = rows[:limit]
+            displayed = limit
+            click.secho("The result was limited to %s rows" % limit, fg="red")
+        else:
+            displayed = len(rows)
+        # Finish the status here: format_output() may replace the cursor with a
+        # plain list when auto-expand is on, which would hide ``rowcount`` from
+        # format_status(). The batched cursor only carries the bare SELECT tag.
+        status = "SELECT " + str(displayed)
+        static = _StaticResult(rows, bc.description, bc.adapters, displayed)
+        yield from format_output(title, static, headers, status, settings, self.explain_mode)
+
+    def _iter_streaming_batches(self, bc, first, second, title, headers, settings, sql, state):
+        table_format = _resolve_table_format(settings)
+        kwargs = _table_output_kwargs(settings)
+        case_function = settings.case_function
+        render_headers = [] if settings.tuples_only else [case_function(x) for x in headers]
+        column_types = _column_types_from_cursor(bc)
+        continuous = table_format in _STREAMABLE_ROW_FORMATS
+        use_vertical = table_format == "vertical"
+
+        # Mirror format_output()'s auto-expand decision, measured on the first
+        # batch before anything is emitted.
+        max_width = settings.max_width
+        if max_width and not use_vertical and render_headers and not self.explain_mode:
+            probe_formatter = TabularOutputFormatter(format_name=table_format)
+            probe = self._physical_lines(probe_formatter.format_output(first, render_headers, column_types=column_types, **kwargs))
+            if probe and len(strip_ansi(probe[0])) > max_width:
+                use_vertical = True
+                continuous = True
+                table_format = "vertical"
+
+        formatter = TabularOutputFormatter(format_name="vertical" if use_vertical else table_format)
+
+        # Row limiting uses the exact same triggers as _should_limit_output,
+        # evaluated while the rows actually flow instead of up front.
+        limit_active = not self.explain_mode and is_select(sql) and not self._has_limit(sql) and self.row_limit != 0
+
+        if title and not settings.tuples_only:
+            yield title
+
+        displayed = 0
+        limited = False
+        batch_index = 0
+        pending = [first, second]
+        delimited = table_format in _DELIMITED_FORMATS
+        header_lines = 0 if "noheader" in table_format else 1
+
+        while True:
+            if pending:
+                batch = pending.pop(0)
+            else:
+                try:
+                    batch = bc.fetchmany()
+                except Exception as ex:
+                    # Keep the rows already displayed; execute_command turns
+                    # this into the usual error report and exit status.
+                    state.error = ex
+                    state.failed = True
+                    raise
+            if not batch:
+                break
+
+            if limit_active and displayed + len(batch) > self.row_limit:
+                batch = batch[: self.row_limit - displayed]
+                limited = True
+
+            # A batch truncated to zero rows means the limit was reached with
+            # the previous batch: stop without rendering an empty segment.
+            if batch:
+                formatted = formatter.format_output(batch, render_headers, column_types=column_types, **kwargs)
+                lines = self._physical_lines(formatted)
+
+                if continuous:
+                    if use_vertical:
+                        # Records are numbered across the whole result set.
+                        lines = self._renumber_vertical_records(lines, displayed)
+                    elif batch_index > 0 and delimited:
+                        # Keep a single CSV/TSV header for the whole stream.
+                        lines = lines[header_lines:]
+                # For width-based formats every batch is a self-contained
+                # table segment rendered by the unchanged formatter machinery.
+
+                for line in lines:
+                    yield line
+
+                displayed += len(batch)
+                batch_index += 1
+
+            if limited:
+                # Do not ask the server for anything else.
+                bc.stop()
+                break
+
+        if limited:
+            # Same wording/count as _limit_output; displayed == limit here.
+            click.secho("The result was limited to %s rows" % displayed, fg="red")
+
+        if not settings.tuples_only:
+            # One footer reporting the number of rows actually shown.
+            yield "SELECT %d" % displayed
+
+    @staticmethod
+    def _physical_lines(formatted):
+        """Flatten formatter output (elements may embed newlines) into the
+        physical lines that a pager can consume."""
+        lines = []
+        for element in formatted:
+            lines.extend(str(element).split("\n"))
+        return lines
+
+    @staticmethod
+    def _renumber_vertical_records(lines, offset):
+        record_index = offset
+        renumbered = []
+        for line in lines:
+            if re.match(r"^[\-\*]*\[\s*RECORD\s+\d+\s*\][\-\*]*$", line):
+                record_index += 1
+                line = _RECORD_NUMBER_RE.sub(lambda m, n=record_index: m.group(1) + str(n) + m.group(2), line)
+            renumbered.append(line)
+        return renumbered
 
     def _handle_server_closed_connection(self, text):
         """Used during CLI execution."""
@@ -1564,6 +1798,49 @@ class PGCli:
         return len(lines) >= (self.prompt_app.output.get_size().rows - 4)
 
     def echo_via_pager(self, text, color=None):
+        # Streaming output: lines are produced batch by batch while the pager
+        # consumes them, so the first screen shows up before the full result
+        # is fetched. Closing the pager stops the generator and releases the
+        # server-side cursor.
+        if not isinstance(text, str):
+            if (
+                self.pgspecial.pager_config == PAGER_OFF
+                or self.watch_command
+                or (hasattr(self, 'commands') and self.commands)
+                or (hasattr(self, 'input_files') and self.input_files)
+            ):
+                for line in text:
+                    click.echo(line, color=color)
+            elif self.pgspecial.pager_config == PAGER_LONG_OUTPUT and self.table_format == "csv":
+                # Mirror the string path: CSV is never paged in long-output mode.
+                for line in text:
+                    click.echo(line, color=color)
+            else:
+                # click writes pager elements verbatim and appends one final
+                # newline, so every line carries its ending except the last
+                # one. The result is byte-identical to joining the lines with
+                # "\n" and handing the whole string to the pager.
+                def line_stream():
+                    previous = None
+                    for line in text:
+                        if previous is not None:
+                            yield previous + "\n"
+                        previous = line
+                    if previous is not None:
+                        yield previous
+
+                try:
+                    click.echo_via_pager(line_stream(), color=color)
+                except BrokenPipeError:
+                    # The pager went away early; the generator's own cleanup
+                    # closes the cursor.
+                    text.close()
+                finally:
+                    close = getattr(text, "close", None)
+                    if close is not None:
+                        close()
+            return
+
         # Disable pager for -c/--command and -f/--file modes and \watch command
         if (
             self.pgspecial.pager_config == PAGER_OFF
@@ -2158,24 +2435,45 @@ def exception_formatter(e, verbose_errors: bool = False):
     return click.style(s, fg="red")
 
 
-def format_output(title, cur, headers, status, settings, explain_mode=False):
-    output = []
-    expanded = settings.expanded or settings.table_format == "vertical"
+def _resolve_table_format(settings):
+    """Pick the concrete tabulate/format name for *settings*."""
     if settings.tuples_only:
         # Rows and nothing else, so an unadorned format. This wins over
         # expanded output: with the headers suppressed there is no label
         # column left for the vertical formatter to lay out.
-        table_format = "plain"
-    elif settings.expanded:
-        table_format = "vertical"
-    else:
-        table_format = settings.table_format
-    max_width = settings.max_width
-    case_function = settings.case_function
+        return "plain"
+    if settings.expanded:
+        return "vertical"
+    return settings.table_format
+
+
+def _make_formatter(settings, explain_mode=False):
     if explain_mode:
-        formatter = ExplainOutputFormatter(max_width or 100)
-    else:
-        formatter = TabularOutputFormatter(format_name=table_format)
+        return ExplainOutputFormatter(settings.max_width or 100)
+    return TabularOutputFormatter(format_name=_resolve_table_format(settings))
+
+
+def _column_types_from_cursor(cur):
+    """Mirror the column-type inference pgcli hands to the formatter, using
+    the cursor description instead of the fetched values."""
+    column_types = None
+    if hasattr(cur, "description") and cur.description:
+        column_types = []
+        for d in cur.description:
+            col_type = cur.adapters.types.get(d.type_code)
+            type_name = col_type.name if col_type else None
+            if type_name in ("numeric", "float4", "float8"):
+                column_types.append(float)
+            if type_name in ("int2", "int4", "int8"):
+                column_types.append(int)
+            else:
+                column_types.append(str)
+    return column_types
+
+
+def _table_output_kwargs(settings):
+    """Build the cli_helpers keyword arguments shared by the buffered and
+    streaming render paths so their output stays identical."""
 
     def format_array(val):
         if val is None:
@@ -2190,14 +2488,6 @@ def format_output(title, cur, headers, status, settings, explain_mode=False):
             row[:] = [format_array(val) if isinstance(val, list) else val for val in row]
 
         return data, headers
-
-    def format_status(cur, status):
-        # redshift does not return rowcount as part of status.
-        # See https://github.com/dbcli/pgcli/issues/1320
-        if cur and hasattr(cur, "rowcount") and cur.rowcount is not None:
-            if status and not status.endswith(str(cur.rowcount)):
-                status += " %s" % cur.rowcount
-        return status
 
     output_kwargs = {
         "sep_title": "RECORD {n}",
@@ -2219,13 +2509,39 @@ def format_output(title, cur, headers, status, settings, explain_mode=False):
     if settings.column_date_formats:
         output_kwargs["preprocessors"] += (format_timestamps,)
 
-    if table_format == "csv":
+    if _resolve_table_format(settings) == "csv":
         # The default CSV dialect is "excel" which is not handling newline values correctly
         # Nevertheless, we want to keep on using "excel" on Windows since it uses '\r\n'
         # as the line terminator
         # https://github.com/dbcli/pgcli/issues/1102
         dialect = "excel" if platform.system() == "Windows" else "unix"
         output_kwargs["dialect"] = dialect
+
+    return output_kwargs
+
+
+def format_status(cur, status):
+    # redshift does not return rowcount as part of status.
+    # See https://github.com/dbcli/pgcli/issues/1320
+    if cur and hasattr(cur, "rowcount") and cur.rowcount is not None:
+        if status and not status.endswith(str(cur.rowcount)):
+            status += " %s" % cur.rowcount
+    return status
+
+
+def _as_line_iterable(formatted):
+    if isinstance(formatted, str):
+        return iter(formatted.splitlines())
+    return iter(formatted)
+
+
+def format_output(title, cur, headers, status, settings, explain_mode=False):
+    output = []
+    expanded = settings.expanded or settings.table_format == "vertical"
+    max_width = settings.max_width
+    case_function = settings.case_function
+    formatter = _make_formatter(settings, explain_mode)
+    output_kwargs = _table_output_kwargs(settings)
 
     # The title is printed unless there is none, or -t asked for rows only.
     if title and not settings.tuples_only:
@@ -2235,34 +2551,21 @@ def format_output(title, cur, headers, status, settings, explain_mode=False):
         headers = [] if settings.tuples_only else [case_function(x) for x in headers]
         if max_width is not None:
             cur = list(cur)
-        column_types = None
-        if hasattr(cur, "description"):
-            column_types = []
-            for d in cur.description:
-                col_type = cur.adapters.types.get(d.type_code)
-                type_name = col_type.name if col_type else None
-                if type_name in ("numeric", "float4", "float8"):
-                    column_types.append(float)
-                if type_name in ("int2", "int4", "int8"):
-                    column_types.append(int)
-                else:
-                    column_types.append(str)
+        column_types = _column_types_from_cursor(cur)
 
-        formatted = formatter.format_output(cur, headers, **output_kwargs)
-        if isinstance(formatted, str):
-            formatted = iter(formatted.splitlines())
+        formatted = _as_line_iterable(formatter.format_output(cur, headers, **output_kwargs))
         first_line = next(formatted)
         formatted = itertools.chain([first_line], formatted)
         if not explain_mode and not expanded and max_width and len(strip_ansi(first_line)) > max_width and headers:
-            formatted = formatter.format_output(
-                cur,
-                headers,
-                format_name="vertical",
-                column_types=column_types,
-                **output_kwargs,
+            formatted = _as_line_iterable(
+                formatter.format_output(
+                    cur,
+                    headers,
+                    format_name="vertical",
+                    column_types=column_types,
+                    **output_kwargs,
+                )
             )
-            if isinstance(formatted, str):
-                formatted = iter(formatted.splitlines())
 
         output = itertools.chain(output, formatted)
 
@@ -2271,6 +2574,123 @@ def format_output(title, cur, headers, status, settings, explain_mode=False):
         output = itertools.chain(output, [format_status(cur, status)])
 
     return output
+
+
+class _StaticResult:
+    """Cursor-like container for a fully fetched, in-memory result set.
+
+    Keeps the description/adapters/rowcount surface used by
+    :func:`format_output` while iterating over fixed rows."""
+
+    def __init__(self, rows, description, adapters, rowcount):
+        self._rows = rows
+        self.description = description
+        self.adapters = adapters
+        self.rowcount = rowcount
+
+    def __iter__(self):
+        return iter(self._rows)
+
+    def __bool__(self):
+        return True
+
+
+# Formats whose lines are independent once the header block has been emitted:
+# batches can be streamed and concatenated into one continuous table without
+# changing a single byte of the buffered rendering. Width-based formats (the
+# tabulate family, incl. plain) keep per-batch table segments because their
+# column padding depends on every row of the render.
+_STREAMABLE_ROW_FORMATS = frozenset(("csv", "csv-tab", "csv-noheader", "csv-tab-noheader", "tsv", "vertical"))
+# Delimited formats emit exactly one leading header line (unless *noheader*).
+_DELIMITED_FORMATS = frozenset(("csv", "csv-tab", "csv-noheader", "csv-tab-noheader", "tsv"))
+_RECORD_NUMBER_RE = re.compile(r"(\[\s*RECORD\s+)\d+(\s*\])")
+
+
+class _StreamState:
+    """Per-command mutable state for a lazy output run. Nothing here is shared
+    between commands or PGCli sessions, so reruns start from a clean state."""
+
+    def __init__(self):
+        self.error = None
+        self.failed = False
+        self.all_success = True
+        self.meta_changed = False
+        self.mutated = False
+        self.db_changed = False
+        self.path_changed = False
+        self.is_special = None
+        self.total = 0
+        self.execution = 0
+        self.cursors = []
+
+    def register_cursor(self, cur):
+        self.cursors.append(cur)
+
+    def close_all(self):
+        for cur in self.cursors:
+            try:
+                cur.close()
+            except Exception:
+                # BatchedCursor.close() already swallows database errors;
+                # nothing else should prevent the remaining cursors from
+                # closing.
+                pass
+        self.cursors.clear()
+
+
+class _LazyOutput:
+    """Iterable of output lines that pulls batches from the server on demand.
+
+    Lines produced during the first pass are cached so a second consumer (the
+    log file, in addition to the pager) can replay the exact same output
+    without asking the server for more rows."""
+
+    def __init__(self, line_generator, state):
+        self._generator = line_generator
+        self.state = state
+        self._cache = []
+        self._exhausted = False
+        self._started = False
+
+    def __iter__(self):
+        if self._exhausted:
+            return iter(self._cache)
+        # Sequential use only: the first iterator drives the generator, later
+        # ones (e.g. the log file after the pager) replay the complete cache.
+        return self._caching_iter()
+
+    def __contains__(self, item):
+        # Substring check over the produced lines, matching the old behavior of
+        # testing membership in the joined string. Iteration is cached, so
+        # repeated checks keep working and never hit the server twice.
+        for line in self:
+            if item in line:
+                return True
+        return False
+
+    def _caching_iter(self):
+        self._started = True
+        for line in self._cache:
+            yield line
+        if not self._exhausted:
+            for line in self._generator:
+                self._cache.append(line)
+                yield line
+            self._exhausted = True
+
+    def close(self):
+        """Stop fetching and release every portal still open.
+
+        Output that nobody started consuming is left untouched so callers can
+        still iterate it later; its cursors rely on their own cleanup."""
+        if not self._started or self._exhausted:
+            if self._exhausted:
+                self.state.close_all()
+            return
+        close = getattr(self._generator, "close", None)
+        if close is not None:
+            close()
+        self.state.close_all()
 
 
 def parse_service_info(service):
